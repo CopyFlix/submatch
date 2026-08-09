@@ -1,19 +1,22 @@
-from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse, HTMLResponse
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+from typing import Union, List, Dict, Any, Optional
+import json
 import re
 from rapidfuzz import fuzz
 
-app = FastAPI(title="Torrentio & OpenSubtitles Matcher API")
+app = FastAPI(
+    title="Torrentio & OpenSubtitles Matcher API",
+    description="API لمطابقة جودات الأفلام مع الترجمات بنفس الخوارزميات تماماً"
+)
 
-# ==========================================
-# 1. التنظيف بنفس طريقة Streamlit المحلية تماماً
-# ==========================================
-def extract_clean_text(text, ignore_title=""):
+# --- دالة الاستخراج والتنظيف الذكي (نفس الكود الأصلي 100%) ---
+def extract_clean_text(text: str, ignore_title: str = "") -> str:
     if not text:
         return ""
     text = text.lower()
     
-    # تنظيف العبارات الشائعة التي لا فائدة منها
+    # تنظيف العبارات الشائعة التي لا فائدة منها في Stremio
     text = re.sub(r'👤\s*\d+|💾\s*[\d\.]+\s*[g|m]b|⚙️\s*\w+|multi audio|torrentio', '', text)
     
     # تحويل الرموز لمسافات
@@ -28,123 +31,124 @@ def extract_clean_text(text, ignore_title=""):
                 
     return re.sub(r'\s+', ' ', text).strip()
 
-# ==========================================
-# 2. استخراج الحلقات لحماية المسلسلات فقط
-# ==========================================
-def extract_episode(filename):
-    name_lower = (filename or "").lower()
-    ep_match = re.search(r'[s]\d{1,2}[e](\d{1,3})\b', name_lower) or \
-               re.search(r'\b\d{1,2}x(\d{1,3})\b', name_lower) or \
-               re.search(r'-\s*0*(\d{1,3})\b', name_lower)
-    return int(ep_match.group(1)) if ep_match else None
-
-# ==========================================
-# 3. Parsing JSON
-# ==========================================
-def parse_streams(data, ignore_title=""):
+def parse_torrentio_streams(data, ignore_title=""):
     streams = []
-    streams_data = data.get("streams", data) if isinstance(data, dict) else data
-    if not isinstance(streams_data, list): return []
+    if isinstance(data, dict) and "streams" in data:
+        data = data["streams"]
+    elif not isinstance(data, list):
+        return []
         
-    for item in streams_data:
-        if not isinstance(item, dict): continue
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        # محاولة أخذ الاسم المباشر من behaviorHints أو title
         filename = item.get("behaviorHints", {}).get("filename", "")
         if not filename:
             title_lines = item.get("title", "").split("\n")
             filename = title_lines[0] if title_lines else item.get("name", "")
             
+        clean_tags = extract_clean_text(filename, ignore_title)
         streams.append({
             "original_name": filename,
-            "ep": extract_episode(filename),
-            "clean_tags": extract_clean_text(filename, ignore_title)
+            "raw_item": item,
+            "clean_tags": clean_tags
         })
     return streams
 
-def parse_subtitles(data, ignore_title=""):
+def parse_opensubtitles(data, ignore_title=""):
     subtitles = []
-    subs_data = data.get("subtitles", data) if isinstance(data, dict) else data
-    if not isinstance(subs_data, list): return []
+    if not isinstance(data, list):
+        return []
         
-    for item in subs_data:
-        if not isinstance(item, dict): continue
+    for item in data:
+        if not isinstance(item, dict):
+            continue
         sub_name = item.get("SubFileName") or item.get("MovieReleaseName") or ""
+        clean_tags = extract_clean_text(sub_name, ignore_title)
         subtitles.append({
             "sub_id": item.get("IDSubtitleFile") or item.get("IDSubtitle"),
             "original_name": sub_name,
-            "ep": extract_episode(sub_name),
-            "clean_tags": extract_clean_text(sub_name, ignore_title)
+            "raw_item": item,
+            "clean_tags": clean_tags
         })
     return subtitles
 
-# ==========================================
-# 4. نفس منطق Streamlit (token_set_ratio)
-# ==========================================
-def calculate_score(stream, sub):
-    # حماية المسلسلات: إذا كان كلاهما يحتوي على رقم حلقة مختلف، يتم الاستبعاد
-    if stream["ep"] is not None and sub["ep"] is not None:
-        if stream["ep"] != sub["ep"]:
-            return -1000
 
-    # استخدام نفس الدالة المحلية 100%
-    return fuzz.token_set_ratio(stream["clean_tags"], sub["clean_tags"])
+# --- نماذج البيانات المجمعة (Request Models) ---
+class MatchRequest(BaseModel):
+    movie_title: Optional[str] = ""
+    torrentio_json: Union[Dict[str, Any], List[Any], str]
+    opensubtitles_json: Union[List[Dict[str, Any]], str]
 
-# ==========================================
-# 5. Endpoints
-# ==========================================
-@app.post("/api/match")
-async def match_subtitles(request: Request):
-    try:
-        body = await request.json()
-        t_data = body.get("torrentio_json", {})
-        s_data = body.get("opensubtitles_json", {})
-        movie_title = body.get("movie_title", "")
 
-        streams = parse_streams(t_data, movie_title)
-        subtitles = parse_subtitles(s_data, movie_title)
+@app.post("/match")
+def match_subtitles(payload: MatchRequest):
+    # معالجة المدخلات سواء كانت كود JSON نصي أو JSON كـ Object/List مباشر
+    t_data = payload.torrentio_json
+    if isinstance(t_data, str):
+        try:
+            t_data = json.loads(t_data)
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"خطأ في صيغة torrentio_json: {str(e)}")
+            
+    s_data = payload.opensubtitles_json
+    if isinstance(s_data, str):
+        try:
+            s_data = json.loads(s_data)
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"خطأ في صيغة opensubtitles_json: {str(e)}")
 
-        if not streams or not subtitles:
-            return JSONResponse({"error": "No valid streams or subtitles found."}, status_code=400)
+    movie_title = payload.movie_title or ""
+    
+    # تنفيذ الاستخراج والتحليل بنفس طريقة Streamlit
+    streams = parse_torrentio_streams(t_data, movie_title)
+    subtitles = parse_opensubtitles(s_data, movie_title)
 
-        best_overall_score = -1
-        best_pair = None
-        matrix_results = []
+    if not streams or not subtitles:
+        raise HTTPException(
+            status_code=400, 
+            detail=" تعذر استخراج البيانات. تأكد من أن الـ JSON مكتوب بشكل صحيح ويحتوي على عناصر قابلة للتحليل."
+        )
 
-        for stream in streams:
-            best_sub_for_stream = None
-            max_score_for_stream = -1
+    best_overall_score = -1
+    best_pair = None
+    matrix_results = []
 
-            for sub in subtitles:
-                score = calculate_score(stream, sub)
-                
-                if score > max_score_for_stream:
-                    max_score_for_stream = score
-                    best_sub_for_stream = sub
-                    
-                if score > best_overall_score:
-                    best_overall_score = score
-                    best_pair = (stream, sub)
+    for stream in streams:
+        best_sub_for_stream = None
+        max_score_for_stream = -1
 
-            matrix_results.append({
-                "stream_name": stream["original_name"],
-                "best_subtitle": best_sub_for_stream["original_name"] if best_sub_for_stream else "None",
-                "sub_id": best_sub_for_stream["sub_id"] if best_sub_for_stream else "-",
-                "score": f"{round(max_score_for_stream, 2)}%"
-            })
+        for sub in subtitles:
+            # استخدام نفس الخوارزمية (fuzz.token_set_ratio)
+            score = fuzz.token_set_ratio(stream["clean_tags"], sub["clean_tags"])
 
-        return {
-            "success": True,
-            "overall_best_match": {
-                "stream": best_pair[0]["original_name"],
-                "subtitle": best_pair[1]["original_name"],
-                "sub_id": best_pair[1]["sub_id"],
-                "score": f"{round(best_overall_score, 2)}%"
-            },
-            "matrix_results": matrix_results
-        }
+            if score > max_score_for_stream:
+                max_score_for_stream = score
+                best_sub_for_stream = sub
 
-    except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=500)
+            if score > best_overall_score:
+                best_overall_score = score
+                best_pair = (stream, sub)
 
-@app.get("/")
-def home():
-    return HTMLResponse("<h1>🚀 Matching API (Streamlit Logic Exact Mirror)</h1>")
+        matrix_results.append({
+            "نسخة الفيديو (Torrentio)": stream["original_name"],
+            "أفضل ترجمة متطابقة": best_sub_for_stream["original_name"] if best_sub_for_stream else None,
+            "ID الترجمة": best_sub_for_stream["sub_id"] if best_sub_for_stream else None,
+            "نسبة التوافق": f"{max_score_for_stream}%",
+            "score_numeric": max_score_for_stream
+        })
+
+    # إرجاع النتيجة بالكامل
+    return {
+        "status": "success",
+        "total_streams": len(streams),
+        "total_subtitles": len(subtitles),
+        "best_overall_match": {
+            "torrentio_stream": best_pair[0]["original_name"] if best_pair else None,
+            "opensubtitles_file": best_pair[1]["original_name"] if best_pair else None,
+            "sub_id": best_pair[1]["sub_id"] if best_pair else None,
+            "compatibility_score": f"{best_overall_score}%",
+            "score_numeric": best_overall_score
+        },
+        "matrix_results": matrix_results
+    }
