@@ -6,42 +6,20 @@ from rapidfuzz import fuzz
 app = FastAPI(title="Torrentio & OpenSubtitles Matcher API")
 
 # ==========================================
-# 1. Metadata Extraction
+# 1. التنظيف بنفس طريقة Streamlit المحلية تماماً
 # ==========================================
-def extract_metadata(filename, raw_item=None):
-    if not raw_item:
-        raw_item = {}
-    name_lower = (filename or "").lower()
-    meta = {"res": None, "source": None, "group": None, "ep": None}
-
-    # استخراج رقم الحلقة بدقة (لمنع تداخل الحلقات)
-    ep_match = re.search(r'[s]\d{1,2}[e](\d{1,3})\b', name_lower) or \
-               re.search(r'\b\d{1,2}x(\d{1,3})\b', name_lower) or \
-               re.search(r'-\s*0*(\d{1,3})\b', name_lower) or \
-               re.search(r'\be0*(\d{1,3})\b', name_lower) or \
-               re.search(r'episode\s*0*(\d{1,3})\b', name_lower)
-    
-    if ep_match:
-        meta["ep"] = int(ep_match.group(1))
-
-    if re.search(r'bluray|bdrip|remux|\[bd\]', name_lower): meta["source"] = 'bluray'
-    elif re.search(r'web-dl|webrip|web|amzn|crunchyroll|shahid', name_lower): meta["source"] = 'web'
-    elif re.search(r'dvdrip|dvdscr|dvd', name_lower): meta["source"] = 'dvd'
-
-    group_match = re.search(r'^\[([^\]]+)\]', filename) or re.search(r'-([a-zA-Z0-9_]+)(?:\.\w{2,4})?$', filename)
-    if group_match:
-        meta["group"] = group_match.group(1).lower().strip()
-
-    return meta
-
 def extract_clean_text(text, ignore_title=""):
-    if not text: return ""
+    if not text:
+        return ""
     text = text.lower()
     
-    stop_words = r'👤\s*\d+|💾\s*[\d\.]+\s*[g|m]b|⚙️\s*\w+|multi audio|torrentio|1080p|720p|2160p|4k|hevc|x265|x264|dual audio|mkv|mp4|srt|ass'
-    text = re.sub(stop_words, '', text)
+    # تنظيف العبارات الشائعة التي لا فائدة منها
+    text = re.sub(r'👤\s*\d+|💾\s*[\d\.]+\s*[g|m]b|⚙️\s*\w+|multi audio|torrentio', '', text)
+    
+    # تحويل الرموز لمسافات
     text = re.sub(r'[._\-\[\]\(\)\n\/]', ' ', text)
     
+    # إزالة اسم الفيلم/المسلسل إذا تم تزويده
     if ignore_title:
         clean_title = re.sub(r'[._\-\[\]\(\)]', ' ', ignore_title.lower())
         for word in clean_title.split():
@@ -51,7 +29,17 @@ def extract_clean_text(text, ignore_title=""):
     return re.sub(r'\s+', ' ', text).strip()
 
 # ==========================================
-# 2. Parsing JSON
+# 2. استخراج الحلقات لحماية المسلسلات فقط
+# ==========================================
+def extract_episode(filename):
+    name_lower = (filename or "").lower()
+    ep_match = re.search(r'[s]\d{1,2}[e](\d{1,3})\b', name_lower) or \
+               re.search(r'\b\d{1,2}x(\d{1,3})\b', name_lower) or \
+               re.search(r'-\s*0*(\d{1,3})\b', name_lower)
+    return int(ep_match.group(1)) if ep_match else None
+
+# ==========================================
+# 3. Parsing JSON
 # ==========================================
 def parse_streams(data, ignore_title=""):
     streams = []
@@ -67,7 +55,7 @@ def parse_streams(data, ignore_title=""):
             
         streams.append({
             "original_name": filename,
-            "meta": extract_metadata(filename, item),
+            "ep": extract_episode(filename),
             "clean_tags": extract_clean_text(filename, ignore_title)
         })
     return streams
@@ -83,42 +71,25 @@ def parse_subtitles(data, ignore_title=""):
         subtitles.append({
             "sub_id": item.get("IDSubtitleFile") or item.get("IDSubtitle"),
             "original_name": sub_name,
-            "meta": extract_metadata(sub_name, item),
+            "ep": extract_episode(sub_name),
             "clean_tags": extract_clean_text(sub_name, ignore_title)
         })
     return subtitles
 
 # ==========================================
-# 3. RapidFuzz Core Logic
+# 4. نفس منطق Streamlit (token_set_ratio)
 # ==========================================
 def calculate_score(stream, sub):
-    meta1, meta2 = stream["meta"], sub["meta"]
-
-    # הפلتر القاتل: استبعاد اختلاف الحلقات تماماً
-    if meta1["ep"] is not None and meta2["ep"] is not None:
-        if meta1["ep"] != meta2["ep"]:
+    # حماية المسلسلات: إذا كان كلاهما يحتوي على رقم حلقة مختلف، يتم الاستبعاد
+    if stream["ep"] is not None and sub["ep"] is not None:
+        if stream["ep"] != sub["ep"]:
             return -1000
 
-    # RapidFuzz WRatio
-    base_score = fuzz.WRatio(stream["clean_tags"], sub["clean_tags"])
-
-    # Metadata Scoring
-    if meta1["group"] and meta2["group"]:
-        if meta1["group"] == meta2["group"]:
-            base_score += 30  
-        else:
-            base_score -= 15  
-
-    if meta1["source"] and meta2["source"]:
-        if meta1["source"] == meta2["source"]:
-            base_score += 20
-        else:
-            base_score -= 25
-
-    return base_score
+    # استخدام نفس الدالة المحلية 100%
+    return fuzz.token_set_ratio(stream["clean_tags"], sub["clean_tags"])
 
 # ==========================================
-# 4. API Endpoints
+# 5. Endpoints
 # ==========================================
 @app.post("/api/match")
 async def match_subtitles(request: Request):
@@ -134,13 +105,13 @@ async def match_subtitles(request: Request):
         if not streams or not subtitles:
             return JSONResponse({"error": "No valid streams or subtitles found."}, status_code=400)
 
-        best_overall_score = -9999
+        best_overall_score = -1
         best_pair = None
         matrix_results = []
 
         for stream in streams:
             best_sub_for_stream = None
-            max_score_for_stream = -9999
+            max_score_for_stream = -1
 
             for sub in subtitles:
                 score = calculate_score(stream, sub)
@@ -157,7 +128,7 @@ async def match_subtitles(request: Request):
                 "stream_name": stream["original_name"],
                 "best_subtitle": best_sub_for_stream["original_name"] if best_sub_for_stream else "None",
                 "sub_id": best_sub_for_stream["sub_id"] if best_sub_for_stream else "-",
-                "score": round(max_score_for_stream, 2)
+                "score": f"{round(max_score_for_stream, 2)}%"
             })
 
         return {
@@ -166,7 +137,7 @@ async def match_subtitles(request: Request):
                 "stream": best_pair[0]["original_name"],
                 "subtitle": best_pair[1]["original_name"],
                 "sub_id": best_pair[1]["sub_id"],
-                "score": round(best_overall_score, 2)
+                "score": f"{round(best_overall_score, 2)}%"
             },
             "matrix_results": matrix_results
         }
@@ -176,12 +147,4 @@ async def match_subtitles(request: Request):
 
 @app.get("/")
 def home():
-    html_content = """
-    <html>
-        <body style="background-color:#0f172a; color:white; text-align:center; padding:50px; font-family:sans-serif;">
-            <h1>🚀 RapidFuzz API on Vercel is Running!</h1>
-            <p>Send POST requests to <b>/api/match</b></p>
-        </body>
-    </html>
-    """
-    return HTMLResponse(content=html_content)
+    return HTMLResponse("<h1>🚀 Matching API (Streamlit Logic Exact Mirror)</h1>")
