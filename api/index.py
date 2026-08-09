@@ -1,19 +1,19 @@
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse, HTMLResponse
+from fastapi.responses import JSONResponse
 import re
 from rapidfuzz import fuzz
 
 app = FastAPI(title="Torrentio & OpenSubtitles Matcher API")
 
 # ==========================================
-# 1. دالة الاستخراج والتنظيف الذكي (نفس المحلي 100%)
+# 1. دالة الاستخراج والتنظيف الذكي
 # ==========================================
 def extract_clean_text(text, ignore_title=""):
     if not text:
         return ""
     text = text.lower()
     
-    # تنظيف العبارات الشائعة التي لا فائدة منها في Stremio
+    # تنظيف العبارات الشائعة التي لا فائدة منها
     text = re.sub(r'👤\s*\d+|💾\s*[\d\.]+\s*[g|m]b|⚙️\s*\w+|multi audio|torrentio', '', text)
     
     # تحويل الرموز لمسافات
@@ -29,7 +29,7 @@ def extract_clean_text(text, ignore_title=""):
     return re.sub(r'\s+', ' ', text).strip()
 
 # ==========================================
-# 2. تحليل البيانات (نفس المحلي 100%)
+# 2. تحليل البيانات
 # ==========================================
 def parse_torrentio_streams(data, ignore_title=""):
     streams = []
@@ -73,7 +73,7 @@ def parse_opensubtitles(data, ignore_title=""):
     return subtitles
 
 # ==========================================
-# 3. المسارات والحساب (نفس المحلي 100%)
+# 3. المسارات والحساب والترتيب
 # ==========================================
 @app.post("/api/match")
 @app.post("/match")
@@ -93,14 +93,14 @@ async def match_subtitles(request: Request):
 
         best_overall_score = -1
         best_pair = None
-        matrix_results = []
+        raw_matrix = []
 
         for stream in streams:
             best_sub_for_stream = None
             max_score_for_stream = -1
 
             for sub in subtitles:
-                # المقارنة المباشرة بنفس الدالة والمكونات
+                # المقارنة المباشرة
                 score = fuzz.token_set_ratio(stream["clean_tags"], sub["clean_tags"])
                 
                 if score > max_score_for_stream:
@@ -111,12 +111,27 @@ async def match_subtitles(request: Request):
                     best_overall_score = score
                     best_pair = (stream, sub)
 
-            matrix_results.append({
+            raw_matrix.append({
                 "stream_name": stream["original_name"],
                 "best_subtitle": best_sub_for_stream["original_name"] if best_sub_for_stream else "غير متوفر",
                 "sub_id": best_sub_for_stream["sub_id"] if best_sub_for_stream else "-",
+                "raw_score": max_score_for_stream,
                 "score": f"{max_score_for_stream}%"
             })
+
+        # 🎯 ترتيب النتائج تنازلياً حسب نسبة التوافق لتمثيل نفس جدول Streamlit تماماً
+        raw_matrix.sort(key=lambda x: x["raw_score"], reverse=True)
+
+        # تنظيف النتائج وتجهيز الـ JSON النهائي
+        matrix_results = [
+            {
+                "stream_name": item["stream_name"],
+                "best_subtitle": item["best_subtitle"],
+                "sub_id": item["sub_id"],
+                "score": item["score"]
+            }
+            for item in raw_matrix
+        ]
 
         return {
             "success": True,
@@ -134,8 +149,6 @@ async def match_subtitles(request: Request):
     except Exception as e:
         return JSONResponse({"error": f"خطأ في معالجة البيانات: {str(e)}"}, status_code=500)
 
-@app.get("/api/match")
-@app.get("/match")
 @app.get("/")
 def home():
     return {"status": "online", "message": "Exact Mirror of Streamlit Matcher API"}
