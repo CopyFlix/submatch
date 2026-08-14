@@ -12,20 +12,20 @@ def extract_clean_text(text, ignore_title=""):
     if not text:
         return ""
     text = text.lower()
-    
+
     # تنظيف العبارات الشائعة التي لا فائدة منها
     text = re.sub(r'👤\s*\d+|💾\s*[\d\.]+\s*[g|m]b|⚙️\s*\w+|multi audio|torrentio', '', text)
-    
+
     # تحويل الرموز لمسافات
     text = re.sub(r'[._\-\[\]\(\)\n\/]', ' ', text)
-    
+
     # إزالة اسم الفيلم/المسلسل إذا تم تزويده
     if ignore_title:
         clean_title = re.sub(r'[._\-\[\]\(\)]', ' ', ignore_title.lower())
         for word in clean_title.split():
             if len(word) > 2:
                 text = text.replace(word, '')
-                
+
     return re.sub(r'\s+', ' ', text).strip()
 
 # ==========================================
@@ -36,7 +36,7 @@ def parse_torrentio_streams(data, ignore_title=""):
     streams_data = data.get("streams", data) if isinstance(data, dict) else data
     if not isinstance(streams_data, list):
         return []
-        
+
     for item in streams_data:
         if not isinstance(item, dict):
             continue
@@ -44,7 +44,7 @@ def parse_torrentio_streams(data, ignore_title=""):
         if not filename:
             title_lines = item.get("title", "").split("\n")
             filename = title_lines[0] if title_lines else item.get("name", "")
-            
+
         clean_tags = extract_clean_text(filename, ignore_title)
         streams.append({
             "original_name": filename,
@@ -58,7 +58,7 @@ def parse_opensubtitles(data, ignore_title=""):
     subs_data = data.get("subtitles", data) if isinstance(data, dict) else data
     if not isinstance(subs_data, list):
         return []
-        
+
     for item in subs_data:
         if not isinstance(item, dict):
             continue
@@ -96,39 +96,54 @@ async def match_subtitles(request: Request):
         raw_matrix = []
 
         for stream in streams:
-            best_sub_for_stream = None
-            max_score_for_stream = -1
-
+            # Score EVERY subtitle against this stream (this part was already a real matrix — the
+            # old code just threw every row but the single best one away before ever returning it).
+            scored_subs = []
             for sub in subtitles:
-                # المقارنة المباشرة
                 score = fuzz.token_set_ratio(stream["clean_tags"], sub["clean_tags"])
-                
-                if score > max_score_for_stream:
-                    max_score_for_stream = score
-                    best_sub_for_stream = sub
-                    
-                if score > best_overall_score:
-                    best_overall_score = score
-                    best_pair = (stream, sub)
+                scored_subs.append((score, sub))
+            scored_subs.sort(key=lambda pair: pair[0], reverse=True)
+
+            max_score_for_stream, best_sub_for_stream = (
+                scored_subs[0] if scored_subs else (-1, None)
+            )
+
+            if max_score_for_stream > best_overall_score:
+                best_overall_score = max_score_for_stream
+                best_pair = (stream, best_sub_for_stream)
 
             raw_matrix.append({
                 "stream_name": stream["original_name"],
                 "best_subtitle": best_sub_for_stream["original_name"] if best_sub_for_stream else "غير متوفر",
                 "sub_id": best_sub_for_stream["sub_id"] if best_sub_for_stream else "-",
                 "raw_score": max_score_for_stream,
-                "score": f"{max_score_for_stream}%"
+                "score": f"{max_score_for_stream}%",
+                # NEW — every subtitle's own score against THIS stream, not just the winner. This is
+                # what actually makes the response a matrix: a client caring about one specific
+                # stream (its own selected torrent) can now see a real score for every candidate
+                # subtitle against it, instead of only ever learning about the single best one.
+                "all_matches": [
+                    {
+                        "sub_id": sub["sub_id"],
+                        "subtitle_name": sub["original_name"],
+                        "score": f"{score}%"
+                    }
+                    for score, sub in scored_subs
+                ]
             })
 
         # 🎯 ترتيب النتائج تنازلياً حسب نسبة التوافق لتمثيل نفس جدول Streamlit تماماً
         raw_matrix.sort(key=lambda x: x["raw_score"], reverse=True)
 
-        # تنظيف النتائج وتجهيز الـ JSON النهائي
+        # تنظيف النتائج وتجهيز الـ JSON النهائي — كل الحقول القديمة باقية بدون أي تغيير (أي عميل
+        # تاني بيقرأ الشكل القديم لسه شغال زي ما هو)، all_matches حقل إضافي بس.
         matrix_results = [
             {
                 "stream_name": item["stream_name"],
                 "best_subtitle": item["best_subtitle"],
                 "sub_id": item["sub_id"],
-                "score": item["score"]
+                "score": item["score"],
+                "all_matches": item["all_matches"]
             }
             for item in raw_matrix
         ]
