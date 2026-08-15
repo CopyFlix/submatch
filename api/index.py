@@ -223,8 +223,20 @@ def _rasterize(cues: list[Cue], scale: float, length_bins: int) -> np.ndarray:
     return signal
 
 
+def _fft_correlate_full(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    # Same result as np.correlate(a, b, mode="full") but via FFT convolution — O(n log n) instead
+    # of np.correlate's naive O(n*m), which is what actually caused a real 2-hour-movie request
+    # (~180k bins at _BIN_MS resolution, x9 scale candidates) to time out client-side at 30s. The
+    # identity used: correlate(a, b, full) == convolve(a, reverse(b), full).
+    n = len(a) + len(b) - 1
+    fft_size = 1 << (n - 1).bit_length()
+    fa = np.fft.rfft(a, fft_size)
+    fb = np.fft.rfft(b[::-1], fft_size)
+    return np.fft.irfft(fa * fb, fft_size)[:n]
+
+
 def _best_offset_bins(reference: np.ndarray, target: np.ndarray) -> tuple[int, float]:
-    correlation = np.correlate(reference, target, mode="full")
+    correlation = _fft_correlate_full(reference, target)
     max_offset_bins = int(_MAX_OFFSET_SEARCH_MS / _BIN_MS)
     center = len(target) - 1
     lo = max(0, center - max_offset_bins)
