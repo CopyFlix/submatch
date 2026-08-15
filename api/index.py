@@ -1,6 +1,9 @@
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, Body
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel
+from typing import Optional
 import re
+import numpy as np
 from rapidfuzz import fuzz
 
 app = FastAPI(title="Torrentio & OpenSubtitles Matcher API")
@@ -163,6 +166,111 @@ async def match_subtitles(request: Request):
 
     except Exception as e:
         return JSONResponse({"error": f"خطأ في معالجة البيانات: {str(e)}"}, status_code=500)
+
+
+# ==========================================
+# 4. محاذاة توقيت الترجمة (language-agnostic subtitle-to-subtitle sync)
+# ==========================================
+# لا علاقة له بـ /api/match أعلاه ولا يغيّر منطقه — endpoint مستقل تماماً. الفكرة: بدل تحليل صوت
+# الفيديو (ثقيل ويحتاج تحميل الملف نفسه)، نأخذ توقيت ترجمة أخرى (بأي لغة) ثبت أصلاً أنها مطابقة
+# لنفس نسخة التورنت (sameRelease/أعلى score من /api/match)، ونحاذي توقيت الترجمة العربية عليها عبر
+# مقارنة "إشارة نشاط" (متى يظهر أي سطر) بين الاثنين — لا نص، فقط أرقام start_ms/end_ms، فهذا يعمل
+# بغض النظر عن اللغة. يغطي الحالتين الأكثر شيوعاً: إزاحة ثابتة (انترو/مقدمة مختلفة الطول) وفرق
+# معدل إطارات (23.976 مقابل 25fps) كتمدد خطي. لا يغطي حالة مشاهد محذوفة/مُعاد ترتيبها فعلياً بين
+# النسختين — الـ confidence المُرجعة مصممة خصيصاً ليكتشف العميل هذه الحالة ويتجاهل النتيجة بدل
+# تطبيق محاذاة خاطئة.
+
+class Cue(BaseModel):
+    start_ms: float
+    end_ms: float
+
+
+class AlignRequest(BaseModel):
+    # توقيت الترجمة المرجعية (المؤكد تطابقها مع نسخة التورنت المختارة، أي لغة كانت)
+    reference_cues: list[Cue]
+    # توقيت الترجمة العربية المطلوب إعادة محاذاتها
+    target_cues: list[Cue]
+
+
+class AlignResponse(BaseModel):
+    success: bool
+    offset_ms: float = 0.0
+    scale: float = 1.0
+    # نسبة تداخل إشارة النشاط بعد تطبيق التحويل — 1.0 مطابقة كاملة، قريب من 0 يعني "لا تثق بهذه
+    # النتيجة إطلاقاً" (يجب على العميل تجاهلها والإبقاء على التوقيت الأصلي في هذه الحالة).
+    confidence: float = 0.0
+    error: Optional[str] = None
+
+
+_BIN_MS = 40.0  # دقة أخذ العينات — كافية لأطوال أسطر الحوار المعتادة وسريعة بما يكفي
+_SCALE_CANDIDATES = [
+    1.0,
+    24 / 23.976, 23.976 / 24,
+    25 / 23.976, 23.976 / 25,
+    25 / 24, 24 / 25,
+    30 / 29.97, 29.97 / 30,
+]
+_MAX_OFFSET_SEARCH_MS = 5 * 60 * 1000.0  # لا نبحث عن إزاحة أكبر من 5 دقائق في أي اتجاه
+
+
+def _rasterize(cues: list[Cue], scale: float, length_bins: int) -> np.ndarray:
+    signal = np.zeros(length_bins, dtype=np.float32)
+    for cue in cues:
+        start_bin = max(0, int((cue.start_ms * scale) / _BIN_MS))
+        end_bin = min(length_bins, int((cue.end_ms * scale) / _BIN_MS) + 1)
+        if end_bin > start_bin:
+            signal[start_bin:end_bin] = 1.0
+    return signal
+
+
+def _best_offset_bins(reference: np.ndarray, target: np.ndarray) -> tuple[int, float]:
+    correlation = np.correlate(reference, target, mode="full")
+    max_offset_bins = int(_MAX_OFFSET_SEARCH_MS / _BIN_MS)
+    center = len(target) - 1
+    lo = max(0, center - max_offset_bins)
+    hi = min(len(correlation), center + max_offset_bins + 1)
+    window = correlation[lo:hi]
+    if window.size == 0:
+        return 0, 0.0
+    best_idx = int(np.argmax(window)) + lo
+    shift_bins = best_idx - center  # موجب => يجب تأخير الترجمة الهدف لتحاذي المرجع
+    ref_active = float(np.sum(reference))
+    confidence = float(correlation[best_idx]) / ref_active if ref_active > 0 else 0.0
+    return shift_bins, min(confidence, 1.0)
+
+
+def align_cues(req: AlignRequest) -> AlignResponse:
+    if not req.reference_cues or not req.target_cues:
+        return AlignResponse(success=False, error="reference_cues and target_cues must both be non-empty")
+
+    ref_end = max(c.end_ms for c in req.reference_cues)
+    tgt_end = max(c.end_ms for c in req.target_cues)
+
+    best_result: Optional[AlignResponse] = None
+    for scale in _SCALE_CANDIDATES:
+        length_ms = max(ref_end, tgt_end * scale) + _MAX_OFFSET_SEARCH_MS
+        length_bins = int(length_ms / _BIN_MS) + 1
+        reference_signal = _rasterize(req.reference_cues, 1.0, length_bins)
+        target_signal = _rasterize(req.target_cues, scale, length_bins)
+
+        shift_bins, confidence = _best_offset_bins(reference_signal, target_signal)
+        offset_ms = shift_bins * _BIN_MS
+
+        candidate = AlignResponse(success=True, offset_ms=offset_ms, scale=scale, confidence=confidence)
+        if best_result is None or candidate.confidence > best_result.confidence:
+            best_result = candidate
+
+    assert best_result is not None
+    return best_result
+
+
+@app.post("/api/align", response_model=AlignResponse)
+async def align_subtitles(request: AlignRequest = Body(...)):
+    try:
+        return align_cues(request)
+    except Exception as e:
+        return AlignResponse(success=False, error=str(e))
+
 
 @app.get("/")
 def home():
